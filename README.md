@@ -32,7 +32,7 @@ flowchart LR
         Edge["Edge<br/>dledcam.comoc.net"]
     end
 
-    subgraph RP5["🍓 Raspberry Pi 5<br/>~/dynamic-led-camera (docker compose)"]
+    subgraph Host["🐧 Linux ~/dynamic-led-camera (docker compose)"]
         CF["cloudflared<br/>コンテナ"]
         Nginx["nginx:alpine<br/>dynamic-led-camera :80<br/>(static HTML)"]
         HTML[("public/index.html")]
