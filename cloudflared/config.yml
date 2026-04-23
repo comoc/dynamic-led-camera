@@ -1,0 +1,4 @@
+ingress:
+  - hostname: dledcam.comoc.net
+    service: http://dynamic-led-camera:80
+  - service: http_status:404

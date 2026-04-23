@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>Dynamic LED Camera</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #0b0b0b; color: #eee; font: 14px/1.4 system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  header { padding: 8px 12px; background: #111; border-bottom: 1px solid #222; }
+  header h1 { margin: 0; font-size: 14px; font-weight: 600; letter-spacing: .02em; }
+  main { flex: 1; display: grid; grid-template-rows: 1fr auto; min-height: 0; }
+  .stage { position: relative; overflow: hidden; background: #000; display: grid; place-items: center; min-height: 0; }
+  video, canvas.result { max-width: 100%; max-height: 100%; display: block; }
+  video[hidden], canvas.result[hidden] { display: none; }
+  .stage video { transform: scaleX(1); }
+  .overlay { position: absolute; top: 8px; left: 8px; right: 8px; display: flex; justify-content: space-between; pointer-events: none; font-size: 12px; }
+  .pill { background: rgba(0,0,0,.55); padding: 3px 8px; border-radius: 999px; }
+  .panel { background: #111; border-top: 1px solid #222; padding: 10px 12px; display: grid; gap: 8px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  label { display: inline-flex; gap: 6px; align-items: center; font-size: 12px; color: #bbb; }
+  input[type="range"] { width: 140px; }
+  button { background: #1e7fff; color: #fff; border: 0; padding: 9px 14px; border-radius: 8px; font: inherit; font-weight: 600; }
+  button.secondary { background: #2a2a2a; color: #ddd; }
+  button:disabled { opacity: .4; }
+  .cap { padding: 12px 18px; font-size: 16px; }
+  .status { font-size: 12px; color: #9aa; white-space: pre-wrap; }
+  .tabs { display: flex; gap: 6px; }
+  .tab { background: #222; color: #ccc; padding: 4px 10px; border-radius: 6px; font-size: 12px; cursor: pointer; border: 1px solid transparent; }
+  .tab.active { border-color: #1e7fff; color: #fff; }
+  details { background: #151515; border: 1px solid #222; border-radius: 6px; padding: 6px 8px; }
+  details summary { cursor: pointer; font-size: 12px; color: #aaa; }
+  pre { font-size: 11px; color: #89a; margin: 6px 0 0; max-height: 120px; overflow: auto; }
+  a.dl { color: #8cf; text-decoration: none; }
+</style>
+</head>
+<body>
+<header><h1>Dynamic LED Camera — burst max-blend</h1></header>
+<main>
+  <div class="stage" id="stage">
+    <video id="video" playsinline autoplay muted></video>
+    <canvas class="result" id="result" hidden></canvas>
+    <div class="overlay">
+      <span class="pill" id="infoL">—</span>
+      <span class="pill" id="infoR">—</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="tabs">
+      <div class="tab active" data-tab="live">Live</div>
+      <div class="tab" data-tab="result">Result</div>
+    </div>
+
+    <div class="row">
+      <label>枚数 <input type="range" id="frames" min="1" max="50" step="1" value="10" /><span id="framesV">30</span></label>
+      <label>合成
+        <select id="mode">
+          <option value="max">max (既定)</option>
+          <option value="mean">mean</option>
+          <option value="maxLum">max by luminance</option>
+        </select>
+      </label>
+      <label><input type="checkbox" id="manualExp" /> 手動露光</label>
+      <label id="expWrap" hidden>露光 <input type="range" id="expVal" min="1" max="10000" step="1" value="100" /><span id="expValV">100</span>µs単位※</label>
+    </div>
+
+    <div class="row">
+      <button id="capBtn" class="cap">撮影（バースト合成）</button>
+      <button id="switchCam" class="secondary">カメラ切替</button>
+      <button id="saveBtn" class="secondary" disabled>保存</button>
+      <a id="dlLink" class="dl" hidden download="led-capture.png">↓</a>
+    </div>
+
+    <div class="status" id="status">カメラ初期化中…</div>
+
+    <details>
+      <summary>デバイス capabilities</summary>
+      <pre id="caps"></pre>
+    </details>
+  </div>
+</main>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const video = $('video'), result = $('result'), stage = $('stage');
+  const statusEl = $('status'), capsEl = $('caps');
+  const infoL = $('infoL'), infoR = $('infoR');
+  const framesEl = $('frames'), framesV = $('framesV');
+  const modeEl = $('mode');
+  const manualExp = $('manualExp'), expWrap = $('expWrap'), expVal = $('expVal'), expValV = $('expValV');
+  const capBtn = $('capBtn'), switchCam = $('switchCam'), saveBtn = $('saveBtn'), dlLink = $('dlLink');
+
+  let stream = null, track = null, imageCapture = null;
+  let devices = [], deviceIdx = 0;
+  let facing = 'environment';
+
+  framesEl.oninput = () => framesV.textContent = framesEl.value;
+  expVal.oninput = () => { expValV.textContent = expVal.value; applyExposure(); };
+
+  // --- tab switching ---
+  document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.toggle('active', x === t));
+    const mode = t.dataset.tab;
+    video.hidden = (mode !== 'live');
+    result.hidden = (mode !== 'result');
+  });
+
+  // --- camera setup ---
+  async function listCams() {
+    try {
+      const all = await navigator.mediaDevices.enumerateDevices();
+      devices = all.filter(d => d.kind === 'videoinput');
+    } catch {}
+  }
+
+  async function startCamera() {
+    stopStream();
+    const constraints = {
+      audio: false,
+      video: {
+        facingMode: { ideal: facing },
+        width:  { ideal: 1920 },
+        height: { ideal: 1080 },
+        frameRate: { ideal: 60 },
+      },
+    };
+    if (devices.length && devices[deviceIdx]?.deviceId) {
+      constraints.video.deviceId = { exact: devices[deviceIdx].deviceId };
+      delete constraints.video.facingMode;
+    }
+    try {
+      stream = await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (e) {
+      console.error('getUserMedia error:', e);
+      setStatus('カメラ取得失敗: ' + (e.name || '') + ': ' + (e.message || '(no message)') + '\nisSecureContext=' + window.isSecureContext + ' mediaDevices=' + !!navigator.mediaDevices);
+      return;
+    }
+    video.srcObject = stream;
+    track = stream.getVideoTracks()[0];
+    try { imageCapture = ('ImageCapture' in window) ? new ImageCapture(track) : null; } catch { imageCapture = null; }
+
+    const settings = track.getSettings();
+    const caps = track.getCapabilities ? track.getCapabilities() : {};
+    capsEl.textContent = JSON.stringify({ settings, capabilities: caps }, null, 2);
+
+    infoL.textContent = `${settings.width}×${settings.height} @${Math.round(settings.frameRate||0)}fps`;
+    infoR.textContent = facing === 'environment' ? '背面' : '前面';
+
+    // Enable manual exposure UI only if the platform supports it
+    const supportsManualExp = Array.isArray(caps.exposureMode) && caps.exposureMode.includes('manual') && caps.exposureTime;
+    manualExp.disabled = !supportsManualExp;
+    manualExp.parentElement.style.opacity = supportsManualExp ? 1 : 0.4;
+    if (supportsManualExp) {
+      expVal.min = caps.exposureTime.min; expVal.max = caps.exposureTime.max;
+      expVal.step = caps.exposureTime.step || 1;
+      expVal.value = Math.max(caps.exposureTime.min, Math.min(caps.exposureTime.max, settings.exposureTime || caps.exposureTime.min));
+      expValV.textContent = expVal.value;
+    }
+    setStatus('準備OK。対象をフレームに収めて「撮影」。');
+  }
+
+  function stopStream() {
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    stream = null; track = null; imageCapture = null;
+  }
+
+  async function applyExposure() {
+    if (!track || !track.applyConstraints) return;
+    const caps = track.getCapabilities ? track.getCapabilities() : {};
+    try {
+      if (manualExp.checked && caps.exposureMode?.includes('manual')) {
+        await track.applyConstraints({ advanced: [{ exposureMode: 'manual', exposureTime: Number(expVal.value) }] });
+      } else if (caps.exposureMode?.includes('continuous')) {
+        await track.applyConstraints({ advanced: [{ exposureMode: 'continuous' }] });
+      }
+    } catch (e) { setStatus('露光設定失敗: ' + e.message); }
+  }
+  manualExp.onchange = () => { expWrap.hidden = !manualExp.checked; applyExposure(); };
+
+  switchCam.onclick = async () => {
+    await listCams();
+    if (devices.length > 1) {
+      deviceIdx = (deviceIdx + 1) % devices.length;
+    } else {
+      facing = (facing === 'environment') ? 'user' : 'environment';
+    }
+    await startCamera();
+  };
+
+  // --- capture / composite ---
+  let capturing = false;
+
+  capBtn.onclick = async () => {
+    if (!track || capturing) return;
+    capturing = true; capBtn.disabled = true; saveBtn.disabled = true;
+    document.querySelectorAll('.tab').forEach(x => x.classList.toggle('active', x.dataset.tab === 'live'));
+    video.hidden = false; result.hidden = true;
+    const want = Number(framesEl.value);
+    const mode = modeEl.value;
+    const s = track.getSettings();
+    const W = s.width, H = s.height;
+
+    const off = document.createElement('canvas');
+    off.width = W; off.height = H;
+    const offCtx = off.getContext('2d', { willReadFrequently: true });
+
+    // accumulator: Uint8ClampedArray for max/maxLum, Float32 for mean
+    let acc = null, accF = null, count = 0;
+    if (mode === 'mean') accF = new Float32Array(W * H * 4);
+
+    const grabFrame = () => new Promise((resolve) => {
+      if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+        video.requestVideoFrameCallback(() => {
+          offCtx.drawImage(video, 0, 0, W, H);
+          resolve(offCtx.getImageData(0, 0, W, H));
+        });
+      } else {
+        requestAnimationFrame(() => {
+          offCtx.drawImage(video, 0, 0, W, H);
+          resolve(offCtx.getImageData(0, 0, W, H));
+        });
+      }
+    });
+
+    const t0 = performance.now();
+    for (let i = 0; i < want; i++) {
+      const img = await grabFrame();
+      const d = img.data;
+      if (!acc && mode !== 'mean') {
+        acc = new Uint8ClampedArray(d.length);
+        // initialize to zeros (already zero)
+      }
+      if (mode === 'max') {
+        for (let p = 0; p < d.length; p += 4) {
+          if (d[p]   > acc[p])   acc[p]   = d[p];
+          if (d[p+1] > acc[p+1]) acc[p+1] = d[p+1];
+          if (d[p+2] > acc[p+2]) acc[p+2] = d[p+2];
+          acc[p+3] = 255;
+        }
+      } else if (mode === 'maxLum') {
+        for (let p = 0; p < d.length; p += 4) {
+          const lNew = 0.299*d[p] + 0.587*d[p+1] + 0.114*d[p+2];
+          const lOld = 0.299*acc[p] + 0.587*acc[p+1] + 0.114*acc[p+2];
+          if (lNew > lOld) { acc[p]=d[p]; acc[p+1]=d[p+1]; acc[p+2]=d[p+2]; }
+          acc[p+3] = 255;
+        }
+      } else { // mean
+        for (let p = 0; p < d.length; p += 4) {
+          accF[p]   += d[p];
+          accF[p+1] += d[p+1];
+          accF[p+2] += d[p+2];
+        }
+      }
+      count++;
+      if ((i & 3) === 0) setStatus(`撮影中… ${count}/${want}`);
+    }
+
+    if (mode === 'mean') {
+      acc = new Uint8ClampedArray(W * H * 4);
+      for (let p = 0; p < acc.length; p += 4) {
+        acc[p]   = accF[p]   / count;
+        acc[p+1] = accF[p+1] / count;
+        acc[p+2] = accF[p+2] / count;
+        acc[p+3] = 255;
+      }
+    }
+
+    result.width = W; result.height = H;
+    const rctx = result.getContext('2d');
+    rctx.putImageData(new ImageData(acc, W, H), 0, 0);
+
+    // switch to result tab
+    document.querySelectorAll('.tab').forEach(x => x.classList.toggle('active', x.dataset.tab === 'result'));
+    video.hidden = true; result.hidden = false;
+
+    const ms = (performance.now() - t0).toFixed(0);
+    setStatus(`完了: ${count}枚合成 (${mode}) / ${ms}ms`);
+    saveBtn.disabled = false;
+    capturing = false; capBtn.disabled = false;
+  };
+
+  saveBtn.onclick = () => {
+    result.toBlob((blob) => {
+      const url = URL.createObjectURL(blob);
+      dlLink.href = url;
+      dlLink.hidden = false;
+      dlLink.textContent = '↓ ダウンロード';
+      dlLink.click();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+    }, 'image/png');
+  };
+
+  function setStatus(s) { statusEl.textContent = s; }
+
+  (async function init() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setStatus('このブラウザは getUserMedia 非対応です。');
+      return;
+    }
+    await startCamera();
+    // enumerate after permission granted so labels/deviceIds are available
+    await listCams();
+  })();
+})();
+</script>
+</body>
+</html>
