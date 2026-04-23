@@ -110,4 +110,4 @@ ingress rules は `cloudflared/config.yml` でローカル管理。
 
 ## ライセンス
 
-MIT
+[0BSD](LICENSE) (BSD Zero Clause License) — 帰属表示不要、条件ゼロで自由に使用・改変・再配布可。
